@@ -10,6 +10,8 @@ from imblearn.under_sampling import RandomUnderSampler
 from imblearn.combine import SMOTETomek
 import logging
 
+from feature_engineering import FeatureProcessor, create_dsp_feature_processor, create_sample_dsp_data
+
 class SampleBalancer:
     """样本均衡器，处理不同类型的样本不均衡问题"""
     
@@ -215,18 +217,27 @@ class MultiTaskDataset(data.Dataset):
     """多任务数据集类"""
     
     def __init__(self, 
-                 features: np.ndarray,
+                 dense_features: Optional[np.ndarray],
+                 sparse_features: np.ndarray,
                  targets: Dict[str, np.ndarray],
                  scene_ids: np.ndarray,
                  sample_weights: Optional[Dict[str, np.ndarray]] = None):
         """
         Args:
-            features: 特征数据
+            dense_features: 连续特征数据
+            sparse_features: 离散特征数据
             targets: 目标标签字典
             scene_ids: 场景ID
             sample_weights: 样本权重字典
         """
-        self.features = torch.FloatTensor(features)
+        if dense_features is not None:
+            self.dense_features = torch.FloatTensor(dense_features)
+            self.has_dense = True
+        else:
+            self.dense_features = None
+            self.has_dense = False
+            
+        self.sparse_features = torch.LongTensor(sparse_features)
         self.scene_ids = torch.LongTensor(scene_ids)
         
         self.targets = {}
@@ -238,16 +249,23 @@ class MultiTaskDataset(data.Dataset):
             for task, weights in sample_weights.items():
                 self.sample_weights[task] = torch.FloatTensor(weights)
         
-        self.length = len(features)
+        # 使用sparse_features的长度作为数据集长度
+        self.length = len(sparse_features)
         
     def __len__(self):
         return self.length
     
     def __getitem__(self, idx):
         item = {
-            'features': self.features[idx],
+            'sparse_features': self.sparse_features[idx],
             'scene_id': self.scene_ids[idx],
         }
+        
+        # 添加dense特征（如果有）
+        if self.has_dense:
+            item['dense_features'] = self.dense_features[idx]
+        else:
+            item['dense_features'] = torch.zeros(0)  # 空张量
         
         # 添加目标标签
         for task, target in self.targets.items():
@@ -263,17 +281,20 @@ class DataProcessor:
     """数据处理器"""
     
     def __init__(self, 
+                 feature_processor: FeatureProcessor,
                  balance_strategy: str = 'weighted',
                  test_size: float = 0.2,
                  val_size: float = 0.1,
                  random_state: int = 42):
         """
         Args:
+            feature_processor: 特征处理器
             balance_strategy: 样本平衡策略
             test_size: 测试集比例
             val_size: 验证集比例
             random_state: 随机种子
         """
+        self.feature_processor = feature_processor
         self.balance_strategy = balance_strategy
         self.test_size = test_size
         self.val_size = val_size
@@ -282,7 +303,6 @@ class DataProcessor:
         
     def prepare_data(self, 
                     df: pd.DataFrame,
-                    feature_cols: List[str],
                     target_cols: Dict[str, str],
                     scene_col: str) -> Tuple[data.DataLoader, data.DataLoader, data.DataLoader]:
         """
@@ -290,15 +310,16 @@ class DataProcessor:
         
         Args:
             df: 输入数据框
-            feature_cols: 特征列名列表
             target_cols: 目标列名字典 {task_name: column_name}
             scene_col: 场景列名
             
         Returns:
             训练、验证、测试数据加载器
         """
-        # 提取特征和标签
-        X = df[feature_cols].values.astype(np.float32)
+        # 处理特征
+        dense_features, sparse_features = self.feature_processor.fit_transform(df)
+        
+        # 提取标签
         y_dict = {}
         for task, col in target_cols.items():
             y_dict[task] = df[col].values.astype(np.float32)
@@ -306,32 +327,46 @@ class DataProcessor:
         scene_ids = df[scene_col].values.astype(np.int64)
         
         # 数据分割
-        X_temp, X_test, y_temp_dict, y_test_dict, scene_temp, scene_test = self._split_data(
-            X, y_dict, scene_ids, test_size=self.test_size
+        data_temp, data_test, y_temp_dict, y_test_dict, scene_temp, scene_test = self._split_data(
+            (dense_features, sparse_features), y_dict, scene_ids, test_size=self.test_size
         )
         
         # 进一步分割训练和验证集
         adjusted_val_size = self.val_size / (1 - self.test_size)
-        X_train, X_val, y_train_dict, y_val_dict, scene_train, scene_val = self._split_data(
-            X_temp, y_temp_dict, scene_temp, test_size=adjusted_val_size
+        data_train, data_val, y_train_dict, y_val_dict, scene_train, scene_val = self._split_data(
+            data_temp, y_temp_dict, scene_temp, test_size=adjusted_val_size
         )
         
-        # 对训练集进行样本平衡处理
-        X_train_balanced, y_train_balanced, weights_train = self.balancer.fit_transform(
-            X_train, y_train_dict
-        )
+        # 解包训练数据
+        dense_train, sparse_train = data_train
+        dense_val, sparse_val = data_val
+        dense_test, sparse_test = data_test
+        
+        # 对训练集进行样本平衡处理 (只对dense特征进行平衡，sparse特征保持不变)
+        if dense_train is not None:
+            dense_train_balanced, y_train_balanced, weights_train = self.balancer.fit_transform(
+                dense_train, y_train_dict
+            )
+            # 对应调整sparse特征
+            # 注意：这里假设balancer不会改变样本顺序，如果使用重采样，需要相应调整sparse特征
+            sparse_train_balanced = sparse_train
+        else:
+            dense_train_balanced = None
+            sparse_train_balanced = sparse_train
+            y_train_balanced = y_train_dict
+            weights_train = {}
         
         # 创建数据集
         train_dataset = MultiTaskDataset(
-            X_train_balanced, y_train_balanced, scene_train, weights_train
+            dense_train_balanced, sparse_train_balanced, y_train_balanced, scene_train, weights_train
         )
         
         val_dataset = MultiTaskDataset(
-            X_val, y_val_dict, scene_val
+            dense_val, sparse_val, y_val_dict, scene_val
         )
         
         test_dataset = MultiTaskDataset(
-            X_test, y_test_dict, scene_test
+            dense_test, sparse_test, y_test_dict, scene_test
         )
         
         # 创建数据加载器
@@ -350,11 +385,13 @@ class DataProcessor:
         return train_loader, val_loader, test_loader
     
     def _split_data(self, 
-                   X: np.ndarray, 
+                   data: Tuple[Optional[np.ndarray], np.ndarray], 
                    y_dict: Dict[str, np.ndarray], 
                    scene_ids: np.ndarray, 
                    test_size: float) -> Tuple:
         """分割数据"""
+        dense_features, sparse_features = data
+        
         # 使用主任务进行分层抽样
         main_task = list(y_dict.keys())[0]
         y_main = y_dict[main_task]
@@ -371,7 +408,8 @@ class DataProcessor:
             stratify_y = None
         
         # 数据分割
-        indices = np.arange(len(X))
+        data_length = len(sparse_features)
+        indices = np.arange(data_length)
         train_indices, test_indices = train_test_split(
             indices,
             test_size=test_size,
@@ -380,7 +418,12 @@ class DataProcessor:
         )
         
         # 分割特征
-        X_train, X_test = X[train_indices], X[test_indices]
+        if dense_features is not None:
+            dense_train, dense_test = dense_features[train_indices], dense_features[test_indices]
+        else:
+            dense_train, dense_test = None, None
+            
+        sparse_train, sparse_test = sparse_features[train_indices], sparse_features[test_indices]
         scene_train, scene_test = scene_ids[train_indices], scene_ids[test_indices]
         
         # 分割标签
@@ -389,7 +432,7 @@ class DataProcessor:
             y_train_dict[task] = y[train_indices]
             y_test_dict[task] = y[test_indices]
         
-        return X_train, X_test, y_train_dict, y_test_dict, scene_train, scene_test
+        return (dense_train, sparse_train), (dense_test, sparse_test), y_train_dict, y_test_dict, scene_train, scene_test
     
     def get_data_stats(self, y_dict: Dict[str, np.ndarray]) -> Dict[str, Dict]:
         """获取数据统计信息"""
@@ -419,45 +462,4 @@ class DataProcessor:
         
         return stats
 
-def create_sample_data(num_samples: int = 10000, 
-                      num_features: int = 100, 
-                      num_scenes: int = 5) -> pd.DataFrame:
-    """创建示例数据用于测试"""
-    np.random.seed(42)
-    
-    # 生成特征
-    features = np.random.randn(num_samples, num_features)
-    
-    # 生成场景ID
-    scene_ids = np.random.randint(0, num_scenes, num_samples)
-    
-    # 生成CTR标签（点击率）
-    ctr_logits = np.sum(features[:, :10], axis=1) + np.random.randn(num_samples) * 0.5
-    ctr_probs = 1 / (1 + np.exp(-ctr_logits))
-    ctr_labels = (np.random.rand(num_samples) < ctr_probs).astype(float)
-    
-    # 生成CVR标签（转化率，只在点击的基础上）
-    cvr_logits = np.sum(features[:, 10:20], axis=1) + np.random.randn(num_samples) * 0.3
-    cvr_probs = 1 / (1 + np.exp(-cvr_logits))
-    cvr_labels = np.where(ctr_labels == 1, 
-                         (np.random.rand(num_samples) < cvr_probs).astype(float),
-                         np.nan)  # 没有点击就没有转化标签
-    
-    # 生成IVR标签（曝光转化率）
-    ivr_logits = np.sum(features[:, 20:30], axis=1) + np.random.randn(num_samples) * 0.4
-    ivr_probs = 1 / (1 + np.exp(-ivr_logits))
-    ivr_labels = (np.random.rand(num_samples) < ivr_probs * 0.1).astype(float)  # 更稀疏
-    
-    # 创建DataFrame
-    df = pd.DataFrame()
-    
-    # 添加特征
-    for i in range(num_features):
-        df[f'feature_{i}'] = features[:, i]
-    
-    df['scene_id'] = scene_ids
-    df['ctr'] = ctr_labels
-    df['cvr'] = cvr_labels
-    df['ivr'] = ivr_labels
-    
-    return df
+# 注意：create_sample_data 函数已经移动到 feature_engineering.py 中的 create_sample_dsp_data 函数

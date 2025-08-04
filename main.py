@@ -25,7 +25,8 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import DSPConfig, create_sample_config, create_config_from_template, load_config
 from multi_task_dsp_model import MultiTaskMultiSceneDSPModel
-from data_utils import DataProcessor, create_sample_data
+from data_utils import DataProcessor
+from feature_engineering import create_dsp_feature_processor, create_sample_dsp_data
 from trainer import DSPTrainer
 
 def set_seed(seed: int):
@@ -78,39 +79,36 @@ def setup_logging(log_dir: str, level: str = 'INFO'):
 def load_data(config: DSPConfig) -> pd.DataFrame:
     """加载数据"""
     if config.data.generate_sample_data:
-        logging.info("生成示例数据...")
-        df = create_sample_data(
+        logging.info("生成DSP示例数据...")
+        df = create_sample_dsp_data(
             num_samples=config.data.num_samples,
-            num_features=config.data.num_features,
             num_scenes=config.model.num_scenes
         )
-        logging.info(f"生成了 {len(df)} 个样本，{config.data.num_features} 个特征")
-        
-        # 设置特征列
-        config.data.feature_cols = [f'feature_{i}' for i in range(config.data.num_features)]
+        logging.info(f"生成了 {len(df)} 个样本")
         
     elif config.data.data_path:
         logging.info(f"从文件加载数据: {config.data.data_path}")
         df = pd.read_csv(config.data.data_path)
         logging.info(f"加载了 {len(df)} 个样本")
-        
-        if not config.data.feature_cols:
-            # 自动检测特征列
-            exclude_cols = list(config.data.target_cols.values()) + [config.data.scene_col]
-            config.data.feature_cols = [col for col in df.columns if col not in exclude_cols]
-            logging.info(f"自动检测到 {len(config.data.feature_cols)} 个特征列")
     
     else:
         raise ValueError("必须指定数据路径或启用示例数据生成")
     
     return df
 
-def create_model(config: DSPConfig) -> MultiTaskMultiSceneDSPModel:
+def create_model(config: DSPConfig, feature_processor) -> MultiTaskMultiSceneDSPModel:
     """创建模型"""
     logging.info("创建模型...")
     
+    # 获取特征维度信息
+    dense_dim, sparse_dim = feature_processor.get_feature_dimensions()
+    embedding_specs = feature_processor.get_embedding_specs()
+    
     model = MultiTaskMultiSceneDSPModel(
-        feature_dim=len(config.data.feature_cols),
+        dense_dim=dense_dim,
+        sparse_vocab_sizes=embedding_specs['vocab_sizes'],
+        sparse_features=feature_processor.sparse_features,
+        embedding_dim=embedding_specs['embedding_dim'],
         num_scenes=config.model.num_scenes,
         num_experts=config.model.num_experts,
         expert_hidden_dim=config.model.expert_hidden_dim,
@@ -125,6 +123,8 @@ def create_model(config: DSPConfig) -> MultiTaskMultiSceneDSPModel:
     logging.info(f"模型创建完成:")
     logging.info(f"  - 总参数数量: {total_params:,}")
     logging.info(f"  - 可训练参数: {trainable_params:,}")
+    logging.info(f"  - 连续特征维度: {dense_dim}")
+    logging.info(f"  - 离散特征数量: {sparse_dim}")
     logging.info(f"  - 任务数量: {len(config.model.tasks)}")
     logging.info(f"  - 场景数量: {config.model.num_scenes}")
     logging.info(f"  - 专家数量: {config.model.num_experts}")
@@ -217,9 +217,14 @@ def main():
         # 打印数据统计信息
         print_data_stats(df, config.data.target_cols, config.data.scene_col)
         
+        # 特征处理
+        logging.info("创建特征处理器...")
+        feature_processor = create_dsp_feature_processor()
+        
         # 数据预处理
         logging.info("准备数据...")
         data_processor = DataProcessor(
+            feature_processor=feature_processor,
             balance_strategy=config.data.balance_strategy,
             test_size=config.data.test_size,
             val_size=config.data.val_size,
@@ -228,10 +233,12 @@ def main():
         
         train_loader, val_loader, test_loader = data_processor.prepare_data(
             df=df,
-            feature_cols=config.data.feature_cols,
             target_cols=config.data.target_cols,
             scene_col=config.data.scene_col
         )
+        
+        # 打印特征统计信息
+        feature_processor.print_feature_stats()
         
         logging.info(f"数据准备完成:")
         logging.info(f"  - 训练集批次数: {len(train_loader)}")
@@ -239,7 +246,7 @@ def main():
         logging.info(f"  - 测试集批次数: {len(test_loader)}")
         
         # 创建模型
-        model = create_model(config)
+        model = create_model(config, feature_processor)
         
         # 创建训练器
         trainer = DSPTrainer(

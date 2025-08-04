@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple
 from collections import defaultdict
 import math
 
+from feature_engineering import EmbeddingLayer
+
 class SceneAdaptationLayer(nn.Module):
     """场景适配层，为不同场景学习特定的特征变换"""
     
@@ -192,7 +194,10 @@ class MultiTaskMultiSceneDSPModel(nn.Module):
     """多任务多场景DSP广告模型"""
     
     def __init__(self, 
-                 feature_dim: int,
+                 dense_dim: int,
+                 sparse_vocab_sizes: Dict[str, int],
+                 sparse_features: List[str],
+                 embedding_dim: int = 8,
                  num_scenes: int = 5,
                  num_experts: int = 6,
                  expert_hidden_dim: int = 256,
@@ -203,10 +208,21 @@ class MultiTaskMultiSceneDSPModel(nn.Module):
         self.tasks = tasks
         self.num_tasks = len(tasks)
         self.num_scenes = num_scenes
+        self.dense_dim = dense_dim
         
-        # 特征嵌入层
-        self.feature_embedding = nn.Sequential(
-            nn.Linear(feature_dim, 512),
+        # 嵌入层处理sparse特征
+        self.embedding_layer = EmbeddingLayer(
+            vocab_sizes=sparse_vocab_sizes,
+            embedding_dim=embedding_dim,
+            sparse_features=sparse_features
+        )
+        
+        # 计算总特征维度
+        total_feature_dim = dense_dim + self.embedding_layer.total_embedding_dim
+        
+        # 特征融合层
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(total_feature_dim, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(0.2)
@@ -241,14 +257,24 @@ class MultiTaskMultiSceneDSPModel(nn.Module):
         self.gradient_balancer = GradientBalancer(self.num_tasks)
         
     def forward(self, 
-                features: torch.Tensor, 
+                dense_features: torch.Tensor,
+                sparse_features: torch.Tensor, 
                 scene_ids: torch.Tensor) -> Dict[str, torch.Tensor]:
         
-        # 特征嵌入
-        embedded_features = self.feature_embedding(features)
+        # 处理sparse特征嵌入
+        sparse_embedded = self.embedding_layer(sparse_features)
+        
+        # 合并dense和sparse特征
+        if self.dense_dim > 0:
+            combined_features = torch.cat([dense_features, sparse_embedded], dim=1)
+        else:
+            combined_features = sparse_embedded
+        
+        # 特征融合
+        fused_features = self.feature_fusion(combined_features)
         
         # 场景适配
-        scene_adapted_features = self.scene_adapter(embedded_features, scene_ids)
+        scene_adapted_features = self.scene_adapter(fused_features, scene_ids)
         
         # 专家网络输出
         expert_outputs = self.expert_net(scene_adapted_features)  # [batch_size, num_experts, hidden_dim]
@@ -311,11 +337,11 @@ class MultiTaskMultiSceneDSPModel(nn.Module):
         
         return total_loss, task_losses
     
-    def predict(self, features: torch.Tensor, scene_ids: torch.Tensor) -> Dict[str, np.ndarray]:
+    def predict(self, dense_features: torch.Tensor, sparse_features: torch.Tensor, scene_ids: torch.Tensor) -> Dict[str, np.ndarray]:
         """预测接口"""
         self.eval()
         with torch.no_grad():
-            predictions = self.forward(features, scene_ids)
+            predictions = self.forward(dense_features, sparse_features, scene_ids)
             
         # 转换为numpy数组
         results = {}

@@ -259,7 +259,8 @@ class DSPTrainer:
         
         for batch in progress_bar:
             # 移动数据到设备
-            features = batch['features'].to(self.device)
+            dense_features = batch['dense_features'].to(self.device)
+            sparse_features = batch['sparse_features'].to(self.device)
             scene_ids = batch['scene_id'].to(self.device)
             
             # 准备目标和权重
@@ -273,7 +274,7 @@ class DSPTrainer:
                     sample_weights[task] = batch[f'weight_{task}'].to(self.device)
             
             # 前向传播
-            predictions = self.model(features, scene_ids)
+            predictions = self.model(dense_features, sparse_features, scene_ids)
             
             # 计算损失
             loss, batch_task_losses = self.model.compute_loss(
@@ -322,7 +323,8 @@ class DSPTrainer:
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation"):
                 # 移动数据到设备
-                features = batch['features'].to(self.device)
+                dense_features = batch['dense_features'].to(self.device)
+                sparse_features = batch['sparse_features'].to(self.device)
                 scene_ids = batch['scene_id'].to(self.device)
                 
                 # 准备目标
@@ -332,7 +334,7 @@ class DSPTrainer:
                         targets[task] = batch[f'target_{task}'].to(self.device)
                 
                 # 前向传播
-                predictions = self.model(features, scene_ids)
+                predictions = self.model(dense_features, sparse_features, scene_ids)
                 
                 # 计算损失
                 loss, batch_task_losses = self.model.compute_loss(predictions, targets)
@@ -423,11 +425,12 @@ class DSPTrainer:
         
         with torch.no_grad():
             for batch in tqdm(test_loader, desc="Evaluating"):
-                features = batch['features'].to(self.device)
+                dense_features = batch['dense_features'].to(self.device)
+                sparse_features = batch['sparse_features'].to(self.device)
                 scene_ids = batch['scene_id'].to(self.device)
                 
                 # 预测
-                predictions = self.model(features, scene_ids)
+                predictions = self.model(dense_features, sparse_features, scene_ids)
                 
                 # 收集结果
                 all_scene_ids.extend(scene_ids.cpu().numpy())
